@@ -41,10 +41,13 @@ def make_request(method, path, payload=None):
     elif method == 'POST':
         return requests.post(url, headers=headers, data=json.dumps(payload)).json()
 
-# === Get Balance ===
-def get_balance():
-    res = make_request('GET', '/v2/account/info')
-    return float(res['data']['USDT']['available'])
+# === Get Balance for Futures ===
+def get_futures_balance():
+    res = make_request('GET', '/v2/perpetual/account')
+    for item in res['data']['assets']:
+        if item['margin_coin'] == 'USDT':
+            return float(item['available'])
+    return 0
 
 # === Load Learning Memory ===
 def load_memory():
@@ -72,13 +75,13 @@ def save_trade_log(entry):
 
 # === Analyze Market Dynamically with Learning ===
 def analyze_market():
-    symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XAUUSDT']
+    symbols = ['BTCUSDT', 'XAUUSDT']
     mem = load_memory()
     best = {"symbol": None, "confidence": 0}
     for symbol in symbols:
         try:
-            res = requests.get(f"https://api.coinex.com/v2/market/kline?market={symbol}&interval=900&limit=10").json()
-            klines = res['data']['klines'] if 'klines' in res['data'] else res['data']
+            res = requests.get(f"https://api.coinex.com/v1/market/kline?market={symbol}&type=900&limit=10").json()
+            klines = res['data']
             close_prices = [float(k[4]) for k in klines]
             avg = sum(close_prices) / len(close_prices)
             last = close_prices[-1]
@@ -98,53 +101,44 @@ def analyze_market():
     save_memory(mem)
     return best
 
-# === Execute Trade ===
+# === Execute Futures Trade ===
 def execute_trade(signal):
-    if signal['side'] == 'sell':
-        symbol_asset = signal['symbol'].replace('USDT', '')
-        balance_info = make_request('GET', '/v2/account/info')
-        asset_balance = float(balance_info['data'].get(symbol_asset, {}).get('available', 0))
-        if asset_balance <= 0:
-            bot.send_message(chat_id=TG_CHAT_ID, text=f"🚫 لا يوجد رصيد كافٍ لبيع {symbol_asset}.")
-            return
-        amount = round(asset_balance * 0.1, 6)
-    else:
-        usdt_balance = get_balance()
-        amount = round(usdt_balance * 0.1, 2)
-        if amount < 1:
-            bot.send_message(chat_id=TG_CHAT_ID, text="🚫 الرصيد غير كافٍ للشراء.")
-            return
+    symbol = signal['symbol']
+    side = signal['side']
+    direction = 3 if side == 'buy' else 4
 
-    trade_type = 1 if signal['side'] == 'buy' else 2
+    usdt_balance = get_futures_balance()
+    margin_amount = round(usdt_balance * 0.05, 2)
+    if margin_amount < 1:
+        bot.send_message(chat_id=TG_CHAT_ID, text="🚫 الرصيد غير كافٍ للتداول بالعقود.")
+        return
 
-    # Get real-time best price from order book
-    orderbook = requests.get(f"https://api.coinex.com/v2/market/depth?market={signal['symbol']}&limit=1").json()
-    if signal['side'] == 'buy':
-        best_price = float(orderbook['data']['asks'][0][0]) * 1.001
-    else:
-        best_price = float(orderbook['data']['bids'][0][0]) * 0.999
+    ob = requests.get(f"https://api.coinex.com/v2/market/depth?market={symbol}&limit=1").json()
+    price = float(ob['data']['asks'][0][0]) if side == 'buy' else float(ob['data']['bids'][0][0])
+    price *= 1.001 if side == 'buy' else 0.999
 
-    payload = {
-        "market": signal['symbol'],
-        "amount": str(amount),
-        "type": trade_type,
-        "price": str(round(best_price, 4)),
-        "client_id": f"jbreel-{int(time.time())}"
+    order = {
+        "market": symbol,
+        "price": round(price, 2),
+        "amount": 0.01,
+        "side": direction,
+        "leverage": 3,
+        "position_id": 0,
+        "open_type": 1,
+        "external_oid": f"jb-{int(time.time())}"
     }
 
-    direction = "شراء 🟢" if signal['side'] == 'buy' else "بيع 🔴"
+    make_request('POST', '/v2/perpetual/order/create', order)
+
     msg = (
-        f"[Jbreel Crypto] تنفيذ صفقة {direction}\n"
-        f"العملة: {signal['symbol']}\n"
-        f"السعر: {round(best_price, 4)} USDT\n"
-        f"القيمة: {amount} USDT\n"
+        f"[JB-Futures] ✅ صفقة {'شراء 🟢' if side == 'buy' else 'بيع 🔴'}\n"
+        f"الرمز: {symbol}\n"
+        f"السعر: {round(price, 2)} USDT\n"
+        f"الرافعة: 3x\n"
         f"الثقة: {signal['confidence']}"
     )
     bot.send_message(chat_id=TG_CHAT_ID, text=msg)
-
-    save_trade_log({"symbol": signal['symbol'], "side": signal['side'], "price": round(best_price, 4), "amount": amount, "confidence": signal['confidence'], "timestamp": int(time.time())})
-
-    return make_request('POST', '/v2/order/limit', payload)
+    save_trade_log({"symbol": symbol, "side": side, "price": round(price, 2), "confidence": signal['confidence'], "timestamp": int(time.time())})
 
 # === Main Loop ===
 if __name__ == '__main__':
@@ -154,10 +148,10 @@ if __name__ == '__main__':
             if signal['confidence'] >= 0.9:
                 execute_trade(signal)
             else:
-                bot.send_message(chat_id=TG_CHAT_ID, text=f"[Jbreel Crypto] لا توجد صفقة مناسبة حالياً، أفضل فرصة هي {signal['symbol']} بثقة {signal['confidence']}")
+                bot.send_message(chat_id=TG_CHAT_ID, text=f"[JB-Futures] لا توجد صفقة مناسبة، أفضل فرصة: {signal['symbol']} بثقة {signal['confidence']}")
             time.sleep(60)
         except Exception as e:
             bot.send_message(chat_id=TG_CHAT_ID, text=f"⚠️ خطأ: {str(e)}")
             time.sleep(60)
 
-# === End of Jbreel Bot ===
+# === End of JB Futures Bot ===
